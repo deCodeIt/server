@@ -25,6 +25,7 @@ from music_assistant.providers.sendspin.helpers import bridge_client_id_from_uui
 
 from .constants import DEFAULT_BUFFER_FRAMES, VOLUME_CONTROL_SOFTWARE
 from .player import LocalAudioPlayer, get_device_uuid
+from .pulse_audio import PulseOutputStream, enumerate_pulse_sinks, is_available as pulse_available
 
 if TYPE_CHECKING:
     from aiosendspin.server import ExternalStreamStartRequest, SendspinClient, SendspinServer
@@ -52,7 +53,8 @@ class SendspinLocalAudioBridge:
         :param provider: The Local Audio provider instance.
         :param player: The LocalAudioPlayer that owns this bridge.
         :param device_index: The PortAudio device index.
-        :param device_info: The device info dict from sounddevice.query_devices().
+        :param device_info: The device info dict from sounddevice.query_devices(),
+            or from the /dev/snd fallback enumeration (see ``alsa_hw_device``).
         :param sendspin_server: The Sendspin server to register with.
         """
         self.provider = provider
@@ -60,6 +62,10 @@ class SendspinLocalAudioBridge:
         self.player = player
         self.sendspin_server = sendspin_server
         self.device_index = device_index
+        # When enumeration falls back to PulseAudio (e.g. inside the HA OS
+        # Supervisor sandbox where /proc/asound is masked), playback goes
+        # through libpulse-simple instead of PortAudio.
+        self.pulse_sink: str | None = device_info.get("pulse_sink")
         self.device_name: str = device_info["name"]
         self.device_info = device_info
         self.logger = provider.logger.getChild(f"bridge.{self.device_name}")
@@ -220,13 +226,20 @@ class SendspinLocalAudioBridge:
         """Write queued audio data to the soundcard."""
         loop = asyncio.get_running_loop()
         try:
-            self._output_stream = sd.RawOutputStream(
-                device=self.device_index,
-                samplerate=BRIDGE_SAMPLE_RATE,
-                channels=BRIDGE_CHANNELS,
-                dtype="int16",
-                blocksize=DEFAULT_BUFFER_FRAMES,
-            )
+            if self.pulse_sink is not None:
+                self._output_stream = PulseOutputStream(
+                    sink_name=self.pulse_sink,
+                    samplerate=BRIDGE_SAMPLE_RATE,
+                    channels=BRIDGE_CHANNELS,
+                )
+            else:
+                self._output_stream = sd.RawOutputStream(
+                    device=self.device_index,
+                    samplerate=BRIDGE_SAMPLE_RATE,
+                    channels=BRIDGE_CHANNELS,
+                    dtype="int16",
+                    blocksize=DEFAULT_BUFFER_FRAMES,
+                )
             self._output_stream.start()
             self.logger.debug("Audio output stream opened for %s", self.device_name)
 
@@ -387,6 +400,20 @@ class LocalAudioBridgeManager:
 
     @staticmethod
     def _enumerate_output_devices() -> list[dict[str, Any]]:
+        """Enumerate available audio output devices, with a PulseAudio fallback."""
+        devices = LocalAudioBridgeManager._enumerate_output_devices_via_portaudio()
+        if devices:
+            return devices
+        # PortAudio's ALSA host API enumerates cards via /proc/asound. In
+        # sandboxed environments (e.g. the HA OS Supervisor addon container)
+        # /proc/asound is masked, so query_devices() returns nothing. Fall back
+        # to PulseAudio via the Supervisor-provided socket at /run/audio/pulse.sock.
+        if pulse_available():
+            return enumerate_pulse_sinks()
+        return []
+
+    @staticmethod
+    def _enumerate_output_devices_via_portaudio() -> list[dict[str, Any]]:
         """
         Enumerate available audio output devices via sounddevice.
 
@@ -420,3 +447,5 @@ class LocalAudioBridgeManager:
             dev_with_index["index"] = idx
             devices.append(dev_with_index)
         return devices
+
+
