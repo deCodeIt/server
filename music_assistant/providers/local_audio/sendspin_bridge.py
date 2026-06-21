@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
 from typing import TYPE_CHECKING, Any, cast
 
@@ -54,7 +55,7 @@ class SendspinLocalAudioBridge:
         :param player: The LocalAudioPlayer that owns this bridge.
         :param device_index: The PortAudio device index.
         :param device_info: The device info dict from sounddevice.query_devices(),
-            or from the /dev/snd fallback enumeration (see ``alsa_hw_device``).
+            or from PulseAudio fallback enumeration (see ``pulse_sink``).
         :param sendspin_server: The Sendspin server to register with.
         """
         self.provider = provider
@@ -76,7 +77,7 @@ class SendspinLocalAudioBridge:
         self._is_streaming = False
         self._write_queue: asyncio.Queue[bytes | None] = asyncio.Queue()
         self._writer_task: asyncio.Task[None] | None = None
-        self._output_stream: sd.RawOutputStream | None = None
+        self._output_stream: sd.RawOutputStream | PulseOutputStream | None = None
         self._lock = asyncio.Lock()
 
     @property
@@ -253,10 +254,10 @@ class SendspinLocalAudioBridge:
                 data = self._apply_software_volume(data)
                 try:
                     await loop.run_in_executor(None, self._output_stream.write, data)
-                except sd.PortAudioError as err:
-                    self.logger.error("PortAudio error writing to %s: %s", self.device_name, err)
+                except (sd.PortAudioError, RuntimeError) as err:
+                    self.logger.error("Audio write error for %s: %s", self.device_name, err)
                     break
-        except sd.PortAudioError as err:
+        except (sd.PortAudioError, RuntimeError) as err:
             self.logger.error(
                 "Failed to open audio output stream for %s: %s", self.device_name, err
             )
@@ -409,6 +410,9 @@ class LocalAudioBridgeManager:
         # /proc/asound is masked, so query_devices() returns nothing. Fall back
         # to PulseAudio via the Supervisor-provided socket at /run/audio/pulse.sock.
         if pulse_available():
+            logging.getLogger(__name__).info(
+                "PortAudio found no devices, falling back to PulseAudio enumeration"
+            )
             return enumerate_pulse_sinks()
         return []
 
